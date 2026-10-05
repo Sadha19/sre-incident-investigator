@@ -12,3 +12,5 @@ __pycache__/
 # Generated reports
 reports/*.json
 reports/*.html
+#Docker secret
+k8s/docker-rs.yaml
