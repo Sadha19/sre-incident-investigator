@@ -8,19 +8,61 @@ spec:
   selector:
     matchLabels:
       app: inventory-api
+
   template:
     metadata:
       labels:
         app: inventory-api
+
     spec:
       imagePullSecrets:
         - name: docker-rs
       containers:
         - name: inventory-api
-          image: myregistry.com:5000/inventory-api:v1
-            #imagePullPolicy: Never
+
+          image: myregistry.com:5000/inventory-api:v3
           ports:
             - containerPort: 8000
+
+          envFrom:
+            - configMapRef:
+                name: sre-config
+
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_USER
+
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_PASSWORD
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
 
 ---
 apiVersion: v1
@@ -31,7 +73,9 @@ metadata:
 spec:
   selector:
     app: inventory-api
+
   ports:
     - port: 8000
       targetPort: 8000
+
   type: ClusterIP

@@ -1,0 +1,31 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sre
+  namespace: sre-lab
+spec:
+  ingressClassName: nginx
+  rules:
+  - http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend
+            port:
+              number: 8000
+      - path: /payment
+        pathType: Prefix
+        backend:
+          service:
+            name: payment-api
+            port:
+              number: 8000
+      - path: /inventory
+        pathType: Prefix
+        backend:
+          service:
+            name: inventory-api
+            port:
+              number: 8000

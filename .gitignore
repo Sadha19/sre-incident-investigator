@@ -14,3 +14,4 @@ reports/*.json
 reports/*.html
 #Docker secret
 k8s/docker-rs.yaml
+k8s/secret.yaml
