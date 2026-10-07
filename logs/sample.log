@@ -1,0 +1,9 @@
+2026-10-06 10:00:01 INFO Application started successfully
+2026-10-06 10:00:05 INFO Connected to PostgreSQL database
+2026-10-06 10:01:12 WARNING Database connection pool is 80% utilized
+2026-10-06 10:02:45 ERROR Failed to connect to PostgreSQL database
+2026-10-06 10:02:46 ERROR Connection refused: PostgreSQL server unavailable
+2026-10-06 10:02:47 ERROR Retry connection attempt 1 failed
+2026-10-06 10:02:50 ERROR Retry connection attempt 2 failed
+2026-10-06 10:03:01 CRITICAL Database connection could not be established
+2026-10-06 10:03:10 INFO Application health check failed
