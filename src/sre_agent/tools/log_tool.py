@@ -1,230 +1,96 @@
-from kubernetes import client
-from kubernetes.client.rest import ApiException
+import re
+from collections import Counter
+
+from src.sre_agent.models import Severity
+from src.sre_agent.redaction import redact
+
+
+class LogPattern:
+    def __init__(self, name, regex, category, severity):
+        self.name = name
+        self.regex = re.compile(regex, re.IGNORECASE)
+        self.category = category
+        self.severity = severity
 
 
 class LogTool:
     """
-    Kubernetes container log collection and pattern search tool.
+    Kubernetes container log collection and pattern search.
+
+    Changes vs. the original:
+        - Patterns are word-bounded regexes ("ERROR" no longer matches
+          "error_count=0" or "errors_total").
+        - Each pattern carries a category and a base severity; generic
+          ERROR/Exception lines alone are MEDIUM at most. Previously a
+          single "ERROR" line made the whole incident CRITICAL.
+        - Fetch failures raise DataSourceError (from KubernetesTool)
+          instead of returning "" - an unreadable log is not a clean log.
+        - Matched lines are redacted and capped before leaving the tool.
     """
 
     PATTERNS = [
-        "ERROR",
-        "Exception",
-        "Timeout",
-        "Connection refused",
-        "OutOfMemory",
-        "Database connection failed",
-        "HTTP 500",
-        "HTTP 502",
-        "HTTP 503",
-        "500 Internal Server Error",
-        "502 Bad Gateway",
-        "503 Service Unavailable",
-        "UndefinedTable",
-        "UndefinedColumn",
-        "relation does not exist",
-        "database is unavailable",
-        "connection failed",
+        LogPattern("OutOfMemory", r"\bOutOfMemory(Error)?\b|\bOOM[- ]?killed\b|\bCannot allocate memory\b", "MEMORY", Severity.HIGH),
+        LogPattern("Database connection failed", r"\bdatabase connection failed\b|\bcould not connect to (the )?(database|server)\b", "DATABASE", Severity.HIGH),
+        LogPattern("database is unavailable", r"\bdatabase is unavailable\b", "DATABASE", Severity.HIGH),
+        LogPattern("Connection refused", r"\bconnection refused\b", "DEPENDENCY", Severity.HIGH),
+        LogPattern("connection failed", r"\bconnection failed\b", "DEPENDENCY", Severity.MEDIUM),
+        LogPattern("UndefinedTable", r"\bUndefinedTable\b|\brelation \"?[\w.]+\"? does not exist\b", "DATABASE", Severity.HIGH),
+        LogPattern("UndefinedColumn", r"\bUndefinedColumn\b", "DATABASE", Severity.HIGH),
+        LogPattern("Timeout", r"\btime[d]?[- ]?out\b|\bdeadline exceeded\b", "TIMEOUT", Severity.MEDIUM),
+        LogPattern("HTTP 5xx", r"\bHTTP[/ ]?\d?\.?\d? 5\d\d\b|\b\" 5\d\d \d|\b50[0234] (Internal Server Error|Bad Gateway|Service Unavailable|Gateway Timeout)\b", "HTTP_5XX", Severity.MEDIUM),
+        LogPattern("Panic/Fatal", r"\b(panic|FATAL|segmentation fault)\b", "APPLICATION", Severity.HIGH),
+        LogPattern("Exception", r"\b\w*(Exception|Error)\b:|^Traceback \(most recent call last\)", "APPLICATION", Severity.MEDIUM),
+        LogPattern("ERROR", r"(^|[\s\[|])(ERROR|ERR)([\s\]|:]|$)", "APPLICATION", Severity.LOW),
     ]
 
-    def get_pod_names(self, workload_name, namespace="default"):
-        """
-        Find pods whose names start with the workload name.
-        Example:
-            payment-api
-            -> payment-api-7bb5cc8d6-7zxgg
-            -> payment-api-7bb5cc8d6-df24v
-        """
+    # Python stack-frame lines carry no signal of their own.
+    _NOISE_PREFIXES = ("File ", "await ", "return ", "raise ", "^")
 
-        pods = self.k8s.get_pods(namespace=namespace)
+    MAX_MATCHES = 50
+    MAX_LINE_LENGTH = 500
+    # A pattern seen this many times is escalated one level.
+    ESCALATION_THRESHOLD = 10
 
-        matching_pods = []
-
-        for pod in pods:
-            pod_name = pod["name"]
-
-            if pod_name.startswith(workload_name + "-"):
-                matching_pods.append(pod_name)
-
-        return matching_pods
-
-    def get_workload_logs(
-        self,
-        workload_name,
-        namespace="default",
-        tail_lines=100,
-    ):
-        """
-        Get logs from all pods belonging to a workload.
-        """
-
-        pod_names = self.get_pod_names(
-            workload_name=workload_name,
-            namespace=namespace,
-        )
-
-        results = []
-
-        for pod_name in pod_names:
-
-            pod_details = self.k8s.get_pod_details(
-                pod_name=pod_name,
-                namespace=namespace,
-            )
-
-            for container in pod_details["containers"]:
-
-                container_name = container["name"]
-
-                logs = self.get_logs(
-                    pod_name=pod_name,
-                    namespace=namespace,
-                    container=container_name,
-                    tail_lines=tail_lines,
-                )
-
-                results.append({
-                    "pod": pod_name,
-                    "container": container_name,
-                    "logs": logs,
-                })
-
-        return results
-
-    
     def __init__(self, kubernetes_tool):
         self.k8s = kubernetes_tool
-        self.core_api = kubernetes_tool.core_api
 
-    def classify_pattern(self, pattern):
-        """
-        Classify a detected log pattern.
-        """
+    # ---------------------------------------------------------
+    # Collection
+    # ---------------------------------------------------------
 
-        if pattern in [
-            "UndefinedTable",
-            "UndefinedColumn",
-            "Database connection failed",
-            "database is unavailable",
-            "connection failed",
-            "Connection refused",
-        ]:
-            return "DATABASE"
+    def get_logs(self, pod_name, namespace="default", container=None, tail_lines=100):
+        return self.k8s.get_container_logs(
+            pod_name=pod_name, namespace=namespace,
+            container=container, tail_lines=tail_lines,
+        )
 
-        if pattern in [
-            "OutOfMemory",
-        ]:
-            return "MEMORY"
+    def get_previous_logs(self, pod_name, namespace="default", container=None, tail_lines=100):
+        """Logs of the previous container instance (CrashLoopBackOff, OOMKilled)."""
+        return self.k8s.get_container_logs(
+            pod_name=pod_name, namespace=namespace,
+            container=container, tail_lines=tail_lines, previous=True,
+        )
 
-        if pattern in [
-            "Timeout",
-        ]:
-            return "TIMEOUT"
+    # ---------------------------------------------------------
+    # Analysis
+    # ---------------------------------------------------------
 
-        if pattern in [
-            "HTTP 500",
-            "500 Internal Server Error",
-            "HTTP 502",
-            "502 Bad Gateway",
-            "HTTP 503",
-            "503 Service Unavailable",
-        ]:
-            return "HTTP_5XX"
-
-        if pattern in [
-            "Exception",
-            "ERROR",
-        ]:
-            return "APPLICATION"
-
+    @classmethod
+    def classify_pattern(cls, name):
+        for pattern in cls.PATTERNS:
+            if pattern.name == name:
+                return pattern.category
         return "UNKNOWN"
 
-    def get_logs(
-        self,
-        pod_name,
-        namespace="default",
-        container=None,
-        tail_lines=100,
-    ):
-        """
-        Get current container logs.
-        """
-
-        try:
-            logs = self.core_api.read_namespaced_pod_log(
-                name=pod_name,
-                namespace=namespace,
-                container=container,
-                tail_lines=tail_lines,
-                timestamps=True,
-            )
-
-            return logs
-
-        except ApiException as e:
-            print(
-                f"Unable to get logs for pod={pod_name}, "
-                f"container={container}: {e.reason}"
-            )
-            return ""
-
-        except Exception as e:
-            print(
-                f"Unexpected error while getting logs "
-                f"for pod={pod_name}: {e}"
-            )
-            return ""
-
-    def get_previous_logs(
-        self,
-        pod_name,
-        namespace="default",
-        container=None,
-        tail_lines=100,
-    ):
-        """
-        Get logs from the previous container instance.
-        Useful for CrashLoopBackOff and restarted containers.
-        """
-
-        try:
-            logs = self.core_api.read_namespaced_pod_log(
-                name=pod_name,
-                namespace=namespace,
-                container=container,
-                tail_lines=tail_lines,
-                timestamps=True,
-                previous=True,
-            )
-
-            return logs
-
-        except ApiException as e:
-            print(
-                f"Unable to get previous logs for pod={pod_name}, "
-                f"container={container}: {e.reason}"
-            )
-            return ""
-
-        except Exception as e:
-            print(
-                f"Unexpected error while getting previous logs "
-                f"for pod={pod_name}: {e}"
-            )
-            return ""
-
     def search_logs(self, logs):
-        """
-        Search logs for known incident patterns.
-
-        Ignores normal traceback stack-frame lines and
-        focuses on useful error evidence.
-        """
-
         results = {
             "total_lines": 0,
             "matched_patterns": [],
+            "pattern_counts": {},
+            "categories": [],
+            "severity": Severity.OK.name,
             "matches": [],
+            "matches_truncated": False,
         }
 
         if not logs:
@@ -233,29 +99,48 @@ class LogTool:
         lines = logs.splitlines()
         results["total_lines"] = len(lines)
 
+        counts = Counter()
+        severity = Severity.OK
+
         for line in lines:
+            stripped = line.strip()
 
-            stripped_line = line.strip()
+            # Drop the kubelet timestamp prefix before noise checks.
+            content = stripped.split(" ", 1)[1] if stripped[:4].isdigit() and " " in stripped else stripped
 
-            # Ignore Python traceback stack-frame lines.
-            if (
-                stripped_line.startswith("File ")
-                or stripped_line.startswith("await ")
-                or stripped_line.startswith("return ")
-                or stripped_line.startswith("raise ")
-            ):
+            if content.startswith(self._NOISE_PREFIXES):
                 continue
 
+            # First (most specific) pattern wins, so a single line is
+            # not counted as both "Connection refused" and "ERROR".
             for pattern in self.PATTERNS:
+                if not pattern.regex.search(content):
+                    continue
 
-                if pattern.lower() in line.lower():
+                counts[pattern.name] += 1
+                severity = max(severity, pattern.severity)
 
-                    if pattern not in results["matched_patterns"]:
-                        results["matched_patterns"].append(pattern)
-
+                if len(results["matches"]) < self.MAX_MATCHES:
                     results["matches"].append({
-                        "pattern": pattern,
-                        "line": line,
+                        "pattern": pattern.name,
+                        "category": pattern.category,
+                        "line": redact(line[: self.MAX_LINE_LENGTH]),
                     })
+                else:
+                    results["matches_truncated"] = True
+                break
+
+        for pattern in self.PATTERNS:
+            if counts[pattern.name] >= self.ESCALATION_THRESHOLD:
+                severity = max(
+                    severity, Severity(min(pattern.severity + 1, Severity.HIGH))
+                )
+
+        results["matched_patterns"] = [p.name for p in self.PATTERNS if counts[p.name]]
+        results["pattern_counts"] = dict(counts)
+        results["categories"] = sorted({
+            p.category for p in self.PATTERNS if counts[p.name]
+        })
+        results["severity"] = severity.name
 
         return results
