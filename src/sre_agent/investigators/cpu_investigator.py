@@ -33,19 +33,7 @@ def summarize(metric, findings):
 
 
 class CPUInvestigator:
-    """
-    CPU saturation relative to the container's CPU limit, and CFS
-    throttling ratio.
-
-    The original reported raw cores x 100 as a percentage (0.85 cores
-    on a 4-core limit showed "85%"), and also contained a pasted copy
-    of PrometheusTool that shadowed the real one and lacked
-    get_cpu_throttling(), so investigate_throttling() crashed outside
-    of mocked tests.
-
-    CPU is compressible: saturation causes latency, not crashes, so it
-    tops out at HIGH rather than CRITICAL.
-    """
+    """Investigate per-pod CPU usage and CFS throttling."""
 
     def __init__(self, prometheus=None):
         self.prometheus = prometheus or PrometheusTool()
@@ -53,21 +41,21 @@ class CPUInvestigator:
     @staticmethod
     def _get_severity(utilization_pct):
         if utilization_pct >= 90:
-            return Severity.HIGH.name
+            return Severity.CRITICAL.name
         if utilization_pct >= 80:
-            return Severity.MEDIUM.name
-        return Severity.OK.name
+            return Severity.HIGH.name
+        return "NORMAL"
 
     @staticmethod
     def _throttle_severity(ratio):
         if ratio >= 0.25:
-            return Severity.HIGH.name
+            return Severity.CRITICAL.name
         if ratio >= 0.10:
-            return Severity.MEDIUM.name
-        return Severity.OK.name
+            return Severity.HIGH.name
+        return "NORMAL"
 
     def investigate(self, namespace=None, pods=None):
-        result = self.prometheus.get_pod_cpu_utilization(namespace=namespace)
+        result = self.prometheus.get_pod_cpu_usage(namespace=namespace)
 
         if not result["success"]:
             return unavailable("cpu", result["error"])
@@ -87,7 +75,7 @@ class CPUInvestigator:
                 "severity": self._get_severity(pct),
             })
 
-        return summarize("cpu", findings)
+        return findings
 
     def investigate_throttling(self, namespace=None, pods=None):
         result = self.prometheus.get_cpu_throttling(namespace=namespace)
@@ -109,4 +97,4 @@ class CPUInvestigator:
                 "severity": self._throttle_severity(ratio),
             })
 
-        return summarize("cpu_throttling", findings)
+        return findings

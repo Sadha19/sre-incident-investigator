@@ -1,321 +1,269 @@
+"""
+SRE Incident Investigation Agent - deterministic CLI.
+
+Exit codes (so the tool can gate CI/CD or feed automation):
+    0  investigated, severity OK/LOW
+    1  investigated, problems found (MEDIUM or above)
+    2  investigation incomplete (UNKNOWN severity / failed data sources)
+    3  usage or configuration error
+"""
+
 import argparse
+import json
+import logging
+import sys
 
+from src.config import load_settings
+from src.sre_agent.investigators.service_investigator import ServiceInvestigator
+from src.sre_agent.models import Severity
+from src.sre_agent.observability import METRICS, configure_logging, new_correlation_id
+from src.sre_agent.orchestrator import IncidentInvestigator
+from src.sre_agent.remediation import RemediationExecutor, RemediationState, plan
 from src.sre_agent.tools.kubernetes_tool import KubernetesTool
-from src.sre_agent.tools.log_tool import LogTool
-from src.sre_agent.investigators.pod_investigator import PodHealthInvestigator
-from src.sre_agent.investigators.event_investigator import EventInvestigator
+from src.sre_agent.tools.prometheus_tool import PrometheusTool, validate_k8s_name
+
+logger = logging.getLogger(__name__)
+
+EXIT_OK, EXIT_PROBLEMS, EXIT_INCOMPLETE, EXIT_USAGE = 0, 1, 2, 3
 
 
-NAMESPACE = "sre-lab"
+def exit_code_for(report):
+    severity = Severity.parse(report["severity"])
+    if report["status"] == "FAILED" or severity == Severity.UNKNOWN:
+        return EXIT_INCOMPLETE
+    if severity >= Severity.MEDIUM:
+        return EXIT_PROBLEMS
+    return EXIT_OK
 
 
-def find_workload_pods(k8s, workload_name, namespace):
-    """
-    Find pods belonging to a workload using the pod name prefix.
+def build_investigator(settings, use_prometheus=True):
+    k8s = KubernetesTool(timeout_s=settings.k8s_timeout_s)
 
-    Example:
-        payment-api
-        ->
-        payment-api-7bb5cc8d6-7zxgg
-        payment-api-7bb5cc8d6-df24v
-    """
+    prometheus = (
+        PrometheusTool(url=settings.prometheus_url, timeout_s=settings.prometheus_timeout_s)
+        if use_prometheus
+        else None
+    )
 
-    pods = k8s.get_pods(namespace=namespace)
-
-    matching_pods = []
-
-    for pod in pods:
-        pod_name = pod["name"]
-
-        if pod_name.startswith(workload_name + "-"):
-            matching_pods.append(pod_name)
-
-    return matching_pods
-
-
-def determine_severity(pod_diagnosis, event_diagnosis, log_analysis):
-    """
-    Determine overall incident severity.
-    """
-
-    severities = [
-        pod_diagnosis["severity"],
-        event_diagnosis["severity"],
-    ]
-
-    if log_analysis["matched_patterns"]:
-        severities.append("CRITICAL")
-
-    if "CRITICAL" in severities:
-        return "CRITICAL"
-
-    if "WARNING" in severities:
-        return "HIGH"
-
-    return "INFO"
-
-
-def investigate(workload_name, namespace):
-    print()
-    print("=" * 70)
-    print("                    INCIDENT INVESTIGATION")
-    print("=" * 70)
-    print()
-
-    k8s = KubernetesTool()
-    log_tool = LogTool(k8s)
-
-    pod_investigator = PodHealthInvestigator(k8s)
-    event_investigator = EventInvestigator(k8s)
-
-    pods = find_workload_pods(
+    return IncidentInvestigator(
         k8s=k8s,
-        workload_name=workload_name,
-        namespace=namespace,
-    )
-
-    if not pods:
-        print(f"No pods found for workload: {workload_name}")
-        print(f"Namespace: {namespace}")
-        return
-
-    print(f"Workload  : {workload_name}")
-    print(f"Namespace : {namespace}")
-    print(f"Pods found: {len(pods)}")
-
-    for pod_name in pods:
-
-        print()
-        print("=" * 70)
-        print(f"Pod: {pod_name}")
-        print("=" * 70)
-
-        # ---------------------------------------------------------
-        # 1. POD HEALTH
-        # ---------------------------------------------------------
-
-        pod_diagnosis = pod_investigator.investigate_pod(
-            pod_name=pod_name,
-            namespace=namespace,
-        )
-
-        # ---------------------------------------------------------
-        # 2. EVENTS
-        # ---------------------------------------------------------
-
-        event_diagnosis = event_investigator.investigate_pod(
-            pod_name=pod_name,
-            namespace=namespace,
-        )
-
-        # ---------------------------------------------------------
-        # 3. LOGS
-        # ---------------------------------------------------------
-
-        pod_details = k8s.get_pod_details(
-            pod_name=pod_name,
-            namespace=namespace,
-        )
-
-        all_log_analysis = {
-            "total_lines": 0,
-            "matched_patterns": [],
-            "matches": [],
-        }
-
-        for container in pod_details["containers"]:
-
-            container_name = container["name"]
-
-            logs = log_tool.get_logs(
-                pod_name=pod_name,
-                namespace=namespace,
-                container=container_name,
-                tail_lines=100,
-            )
-
-            analysis = log_tool.search_logs(logs)
-
-            all_log_analysis["total_lines"] += analysis["total_lines"]
-
-            for pattern in analysis["matched_patterns"]:
-                if pattern not in all_log_analysis["matched_patterns"]:
-                    all_log_analysis["matched_patterns"].append(pattern)
-
-            all_log_analysis["matches"].extend(
-                analysis["matches"]
-            )
-
-        # ---------------------------------------------------------
-        # 4. OVERALL SEVERITY
-        # ---------------------------------------------------------
-
-        severity = determine_severity(
-            pod_diagnosis=pod_diagnosis,
-            event_diagnosis=event_diagnosis,
-            log_analysis=all_log_analysis,
-        )
-
-        # ---------------------------------------------------------
-        # 5. SUMMARY
-        # ---------------------------------------------------------
-
-        print()
-        print("INCIDENT SUMMARY")
-        print("-" * 70)
-
-        print(f"Pod:")
-        print(f"  {pod_name}")
-
-        print()
-        print(f"Status:")
-        print(f"  {pod_diagnosis['status']}")
-
-        print()
-        print("Restarts:")
-
-        total_restarts = 0
-
-        for container in pod_diagnosis["containers"]:
-            total_restarts += container["restart_count"]
-
-        print(f"  {total_restarts}")
-
-        print()
-        print("Last termination:")
-
-        termination_found = False
-
-        for container in pod_diagnosis["containers"]:
-
-            termination = container.get("last_termination")
-
-            if termination:
-                print(
-                    f"  {termination['reason']}"
-                )
-                termination_found = True
-
-        if not termination_found:
-            print("  None")
-
-        print()
-        print("Recent errors:")
-
-        if all_log_analysis["matched_patterns"]:
-
-            for pattern in all_log_analysis["matched_patterns"]:
-                print(f"  - {pattern}")
-
-        else:
-            print("  None detected")
-
-        print()
-        print("Severity:")
-        print(f"  {severity}")
-
-        # ---------------------------------------------------------
-        # 6. EVIDENCE
-        # ---------------------------------------------------------
-
-        print()
-        print("EVIDENCE")
-        print("-" * 70)
-
-        if pod_diagnosis["issues"]:
-            print()
-            print("Pod Health:")
-
-            for issue in pod_diagnosis["issues"]:
-                print(f"  - {issue}")
-
-        if event_diagnosis["issues"]:
-            print()
-            print("Kubernetes Events:")
-
-            for issue in event_diagnosis["issues"]:
-                print(f"  - {issue}")
-
-        if all_log_analysis["matches"]:
-            print()
-            print("Log Evidence:")
-
-            # Show only first 10 matches.
-            for match in all_log_analysis["matches"][:10]:
-                print(
-                    f"  [{match['pattern']}] "
-                    f"{match['line']}"
-                )
-
-        # ---------------------------------------------------------
-        # 7. RECOMMENDATIONS
-        # ---------------------------------------------------------
-
-        recommendations = []
-
-        recommendations.extend(
-            pod_diagnosis["recommendations"]
-        )
-
-        recommendations.extend(
-            event_diagnosis["recommendations"]
-        )
-
-        if recommendations:
-
-            recommendations = list(
-                dict.fromkeys(recommendations)
-            )
-
-            print()
-            print("RECOMMENDATIONS")
-            print("-" * 70)
-
-            for recommendation in recommendations:
-                print(f"  - {recommendation}")
-
-        print()
-        print("=" * 70)
-
-
-def main():
-
-    parser = argparse.ArgumentParser(
-        description="SRE Incident Investigation Agent"
-    )
-
-    subparsers = parser.add_subparsers(
-        dest="command"
-    )
-
-    investigate_parser = subparsers.add_parser(
-        "investigate",
-        help="Investigate a Kubernetes workload",
-    )
-
-    investigate_parser.add_argument(
-        "workload",
-        help="Workload name, e.g. payment-api",
-    )
-
-    investigate_parser.add_argument(
-        "--namespace",
-        default=NAMESPACE,
-        help="Kubernetes namespace",
-    )
-
-    args = parser.parse_args()
-
-    if args.command == "investigate":
-
-        investigate(
-            workload_name=args.workload,
-            namespace=args.namespace,
-        )
-
+        prometheus=prometheus,
+        service_investigator=ServiceInvestigator(
+            core_api=k8s.core_api, timeout_s=settings.k8s_timeout_s,
+            discovery_api=None,
+        ),
+        log_tail_lines=settings.log_tail_lines,
+        deadline_s=settings.investigation_deadline_s,
+    ), k8s
+
+
+# -------------------------------------------------------------
+# Text rendering
+# -------------------------------------------------------------
+
+def render_text(report, out=sys.stdout):
+    w = out.write
+    line = "=" * 70
+
+    w(f"\n{line}\n{'INCIDENT INVESTIGATION':^70}\n{line}\n\n")
+    w(f"Incident   : {report['incident_id']}\n")
+    w(f"Workload   : {report['workload']}\n")
+    w(f"Namespace  : {report['namespace']}\n")
+    w(f"Severity   : {report['severity']}\n")
+    w(f"Status     : {report['status']} (confidence {report['confidence']})\n")
+    w(f"Pods       : {len(report['pods'])}\n")
+    w(f"Duration   : {report['duration_ms']:.0f} ms\n")
+
+    for reason in report["severity_reasons"]:
+        w(f"  - {reason}\n")
+
+    if report["probable_causes"]:
+        w(f"\nPROBABLE CAUSES\n{'-' * 70}\n")
+        for cause in report["probable_causes"]:
+            w(f"  [{cause['confidence']}] {cause['summary']}\n")
+            for ev in cause["evidence"]:
+                w(f"      evidence: {ev}\n")
+
+    for pod in report["pods"]:
+        w(f"\n{line}\nPod: {pod['pod']}  severity={pod['severity']}\n{line}\n")
+
+        if pod.get("error"):
+            w(f"  investigation error: {pod['error']}\n")
+            continue
+        if pod.get("note"):
+            w(f"  {pod['note']}\n")
+            continue
+        if pod.get("skipped"):
+            w("  skipped: deadline reached\n")
+            continue
+
+        health = pod["health"]
+        restarts = sum(c["restart_count"] for c in health["containers"])
+        terms = [c["last_termination"]["reason"] for c in health["containers"] if c.get("last_termination")]
+        w(f"  Status           : {health['status']}\n")
+        w(f"  Restarts         : {restarts}\n")
+        w(f"  Last termination : {', '.join(terms) or 'None'}\n")
+
+        if health["issues"]:
+            w("  Pod health:\n")
+            for issue in health["issues"]:
+                w(f"    - {issue}\n")
+
+        events = pod.get("events")
+        if events is None:
+            w("  Events: UNAVAILABLE\n")
+        elif events["issues"]:
+            w("  Kubernetes events:\n")
+            for issue in events["issues"]:
+                w(f"    - {issue}\n")
+
+        logs = pod["logs"]
+        unavailable = [c for c in logs["containers"] if not c["available"] and c.get("reason") != "not available"]
+        if unavailable:
+            w(f"  Logs: UNAVAILABLE for {len(unavailable)} stream(s)\n")
+        if logs["matches"]:
+            w(f"  Log evidence (severity {logs['severity']}):\n")
+            for m in logs["matches"][:10]:
+                w(f"    [{m['stream']}:{m['pattern']}] {m['line']}\n")
+
+    service = report.get("service")
+    if service:
+        w(f"\nSERVICE\n{'-' * 70}\n  {service['service']}: {service['status']}\n")
+        for f in service.get("findings", []):
+            w(f"    - {f}\n")
+
+    for key, metric in (report.get("metrics") or {}).items():
+        if not metric["available"]:
+            w(f"\nMetric {key}: UNAVAILABLE ({metric['error']})\n")
+            continue
+        flagged = [f for f in metric["findings"] if f["severity"] != Severity.OK.name]
+        for f in flagged:
+            w(f"\nMetric {key}: {f['pod']} {f['current_usage']} ({f['severity']})\n")
+
+    if report["recommendations"]:
+        w(f"\nRECOMMENDATIONS\n{'-' * 70}\n")
+        for rec in report["recommendations"]:
+            w(f"  - {rec}\n")
+
+    proposals = report.get("remediation_plan") or []
+    if proposals:
+        w(f"\nREMEDIATION PLAN (not executed)\n{'-' * 70}\n")
+        for p in proposals:
+            mode = "automatable" if p["automatable"] else "human approval"
+            w(f"  [{p['risk']} risk, {mode}] {p['description']}\n      $ {p['command']}\n")
+
+    degraded = [s for s in report["data_sources"] if not s["available"]]
+    if degraded or report["notes"]:
+        w(f"\nNOTES\n{'-' * 70}\n")
+        for s in degraded:
+            w(f"  - Data source {s['name']} unavailable: {s['error']}\n")
+        for n in report["notes"]:
+            w(f"  - {n}\n")
+
+    w(f"\n{line}\n")
+
+
+# -------------------------------------------------------------
+# Commands
+# -------------------------------------------------------------
+
+def cmd_investigate(args, settings):
+    investigator, _ = build_investigator(settings, use_prometheus=not args.no_metrics)
+    report = investigator.investigate(args.workload, args.namespace)
+    report["remediation_plan"] = plan(report)
+
+    if args.output == "json":
+        json.dump(report, sys.stdout, indent=2, default=str)
+        sys.stdout.write("\n")
     else:
+        render_text(report)
+
+    if args.metrics_file:
+        with open(args.metrics_file, "w", encoding="utf-8") as fh:
+            fh.write(METRICS.to_prometheus_text())
+
+    return exit_code_for(report)
+
+
+def cmd_remediate(args, settings):
+    investigator, k8s = build_investigator(settings, use_prometheus=not args.no_metrics)
+    report = investigator.investigate(args.workload, args.namespace)
+
+    executor = RemediationExecutor(
+        apps_api=k8s.apps_api,
+        state=RemediationState(settings.remediation_state_file),
+        allow_writes=settings.allow_writes,
+        cooldown_s=settings.remediation_cooldown_s,
+    )
+
+    result = executor.rollout_restart(report, execute=args.execute)
+    json.dump({"incident_id": report["incident_id"], "severity": report["severity"],
+               "plan": plan(report), "result": result}, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+
+    return EXIT_OK if result["reason"] is None else EXIT_PROBLEMS
+
+
+def build_parser(settings):
+    parser = argparse.ArgumentParser(description="SRE Incident Investigation Agent")
+    parser.add_argument("--log-level", default="WARNING")
+    sub = parser.add_subparsers(dest="command")
+
+    for name, help_text in (
+        ("investigate", "Investigate a Kubernetes workload"),
+        ("remediate", "Investigate, then apply guardrailed remediation (dry-run by default)"),
+    ):
+        p = sub.add_parser(name, help=help_text)
+        p.add_argument("workload", help="Workload name, e.g. payment-api")
+        p.add_argument("--namespace", default=settings.default_namespace)
+        p.add_argument("--no-metrics", action="store_true", help="Skip Prometheus")
+
+        if name == "investigate":
+            p.add_argument("--output", choices=["text", "json"], default="text")
+            p.add_argument("--metrics-file", help="Write agent metrics in Prometheus textfile format")
+        else:
+            p.add_argument("--execute", action="store_true",
+                           help="Actually apply (also requires SRE_AGENT_ALLOW_WRITES=true)")
+
+    return parser
+
+
+def main(argv=None):
+    settings = load_settings()
+    parser = build_parser(settings)
+    args = parser.parse_args(argv)
+
+    configure_logging(args.log_level.upper())
+    new_correlation_id()
+
+    if args.command not in ("investigate", "remediate"):
         parser.print_help()
+        return EXIT_USAGE
+
+    try:
+        validate_k8s_name(args.workload, "workload")
+        validate_k8s_name(args.namespace, "namespace")
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    if args.namespace not in settings.allowed_namespaces:
+        print(
+            f"error: namespace '{args.namespace}' is not in SRE_ALLOWED_NAMESPACES "
+            f"({', '.join(settings.allowed_namespaces)})",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+
+    try:
+        if args.command == "investigate":
+            return cmd_investigate(args, settings)
+        return cmd_remediate(args, settings)
+    except Exception as exc:
+        logger.exception("fatal error")
+        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return EXIT_INCOMPLETE
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

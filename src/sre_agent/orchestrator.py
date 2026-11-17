@@ -27,7 +27,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
-from src.sre_agent.investigators.cpu_investigator import CPUInvestigator
+from src.sre_agent.investigators.cpu_investigator import CPUInvestigator, summarize
 from src.sre_agent.investigators.event_investigator import EventInvestigator
 from src.sre_agent.investigators.memory_investigator import MemoryInvestigator
 from src.sre_agent.investigators.pod_investigator import PodHealthInvestigator
@@ -335,6 +335,8 @@ class IncidentInvestigator:
             ("memory", lambda: MemoryInvestigator(self.prometheus).investigate(namespace, pod_names)),
         ):
             result, ms = _timed(run)
+            if isinstance(result, list):
+                result = summarize(key, result)
             metrics[key] = result
             if result["available"]:
                 sources.ok("prometheus", ms)

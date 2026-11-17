@@ -102,7 +102,15 @@ class ServiceInvestigator:
                     label_selector=",".join(f"{k}={v}" for k, v in sorted(selector.items())),
                     **timeout,
                 )
-                matching_pods = list(pods.items or [])
+                matching_pods = [
+                    pod
+                    for pod in (pods.items or [])
+                    if all(
+                        (getattr(getattr(pod, "metadata", None), "labels", None) or {}).get(key)
+                        == value
+                        for key, value in selector.items()
+                    )
+                ]
 
             findings = []
             ready = max(len(ready_addresses), slice_ready)

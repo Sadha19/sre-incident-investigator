@@ -1,6 +1,5 @@
 from src.sre_agent.investigators.cpu_investigator import (
     parse_samples,
-    summarize,
     unavailable,
 )
 from src.sre_agent.models import Severity
@@ -29,7 +28,7 @@ class MemoryInvestigator:
             return Severity.CRITICAL.name
         if memory_usage_pct > 80:
             return Severity.HIGH.name
-        return Severity.OK.name
+        return "NORMAL"
 
     def investigate(self, namespace=None, pods=None):
         usage_result = self.prometheus.get_pod_memory_usage(namespace=namespace)
@@ -79,7 +78,7 @@ class MemoryInvestigator:
                 "severity": self._get_severity(pct),
             })
 
-        return summarize("memory", findings)
+        return findings
 
     def investigate_usage_percentage(self, usage_percentage, pod="unknown"):
         return {
